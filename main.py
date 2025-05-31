@@ -1,10 +1,56 @@
+import streamlit as st
 import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import re # Import the regular expression module
+import re
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime
+import time
+
+# Set page config
+st.set_page_config(
+    page_title="📈 NSE Stock News Analyzer",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-container {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 0.5rem 0;
+    }
+    .positive-change {
+        color: #00ff00;
+        font-weight: bold;
+    }
+    .negative-change {
+        color: #ff0000;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+if 'analysis_run' not in st.session_state:
+    st.session_state.analysis_run = False
+if 'results_data' not in st.session_state:
+    st.session_state.results_data = None
 
 # 🔍 1. Get NSE listed stocks
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def get_nse_stock_list():
     """
     Fetches the list of NSE listed stock symbols from the NSE India archives.
@@ -14,10 +60,9 @@ def get_nse_stock_list():
     url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
     try:
         df = pd.read_csv(url)
-        # Ensure symbols are stripped of whitespace and converted to uppercase
         return [s.strip().upper() for s in df['SYMBOL'].tolist()]
     except Exception as e:
-        print(f"⚠️ Unable to fetch NSE stock list: {e}")
+        st.error(f"⚠️ Unable to fetch NSE stock list: {e}")
         return []
 
 # 📰 2. Get latest positive news from MoneyControl
@@ -30,194 +75,318 @@ def get_positive_news():
     url = "https://www.moneycontrol.com/news/business/stocks/"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     try:
-        response = requests.get(url, headers=headers, timeout=10) # Added timeout
-        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         news = []
-        # Look for news items, adjusting selector if needed based on MoneyControl's current structure
-        # Common selectors might be 'li.clearfix', 'div.each_news', 'h2.bsns_news_heading' etc.
-        # This example assumes 'li' with class 'clearfix' contains the headline text.
+        
         for item in soup.find_all('li', class_='clearfix'):
-            headline_tag = item.find('h2') # Often the headline is within an h2 or a tag
+            headline_tag = item.find('h2')
             if headline_tag:
                 headline = headline_tag.get_text(strip=True)
-                # Keywords indicating positive news
                 if any(word in headline.lower() for word in ["order", "profit", "acquisition", "launch", "contract", "gains", "rises", "boost", "expands"]):
                     news.append(headline)
         return news
     except requests.exceptions.RequestException as e:
-        print(f"⚠️ Error fetching news from MoneyControl: {e}")
+        st.error(f"⚠️ Error fetching news from MoneyControl: {e}")
         return []
     except Exception as e:
-        print(f"⚠️ An unexpected error occurred while parsing news: {e}")
+        st.error(f"⚠️ An unexpected error occurred while parsing news: {e}")
         return []
 
 # 🏷️ 3. Match symbols from NSE stock list with news
-def extract_symbols_from_news(news_list, all_symbols):
+def extract_symbols_from_news(news_list, all_symbols, progress_bar=None):
     """
     Extracts stock symbols from news headlines using a more flexible normalization approach.
-    This version normalizes both headlines and symbols by removing non-alphanumeric characters
-    and then performs a substring match.
-    Args:
-        news_list (list): A list of news headlines.
-        all_symbols (list): A list of all known stock symbols.
-    Returns:
-        list: A list of unique matched stock symbols.
     """
     matched = []
-    # Sort symbols by length in descending order to prioritize matching longer, more specific symbols first
     all_symbols_sorted = sorted(all_symbols, key=len, reverse=True)
-
-    print("--- Debugging Symbol Matching ---")
-    print(f"Total NSE symbols loaded: {len(all_symbols_sorted)}")
-    # Print a sample of symbols to confirm their format
-    print(f"Sample NSE symbols (first 5): {all_symbols_sorted[:5]}...")
-
+    
+    total_news = len(news_list)
+    
     for headline_idx, headline in enumerate(news_list):
+        if progress_bar:
+            progress_bar.progress((headline_idx + 1) / total_news, 
+                                text=f"Processing news {headline_idx + 1}/{total_news}")
+        
         lower_headline = headline.lower()
-        print(f"\n[{headline_idx + 1}/{len(news_list)}] Checking headline: '{headline}'")
-
-        # Normalize the headline: remove all non-alphanumeric characters
-        # This converts "Sun Pharma" to "sunpharma", "Dr Reddy's" to "drreddys", "M&M" to "mm"
         normalized_headline = re.sub(r'[^a-z0-9]', '', lower_headline)
-        print(f"  Normalized headline: '{normalized_headline}'")
-
-        found_match_for_headline = False
-        for symbol_idx, symbol in enumerate(all_symbols_sorted):
+        
+        for symbol in all_symbols_sorted:
             lower_symbol = symbol.lower()
-            
-            # Normalize the symbol: remove all non-alphanumeric characters
-            # This converts "SUNPHARMA" to "sunpharma", "DRREDDY" to "drreddy", "M&M" to "mm"
             normalized_symbol = re.sub(r'[^a-z0-9]', '', lower_symbol)
-
-            if not normalized_symbol: # Skip if normalized symbol is empty (e.g., if original symbol was just '&')
-                # print(f"    Skipping symbol '{symbol}' as its normalized form is empty.") # Too verbose
+            
+            if not normalized_symbol:
                 continue
-
-            # Perform a simple substring check between the normalized headline and symbol
-            # This is more forgiving for variations in news text vs. official symbols
+                
             if normalized_symbol in normalized_headline:
-                print(f"📰 News matched: '{headline}' → {symbol} (Normalized: '{normalized_symbol}' found in '{normalized_headline}')")
                 matched.append(symbol)
-                found_match_for_headline = True
-                break # Found a match for this headline, move to the next headline
-            # else:
-            #     # Uncomment for extremely verbose debugging, shows every non-match
-            #     print(f"    No match: '{normalized_symbol}' not in '{normalized_headline}' for symbol '{symbol}'")
-
-        if not found_match_for_headline:
-            print(f"  No stock symbol matched for this headline.")
-
-    print("--- End Debugging Symbol Matching ---")
+                break
+    
     return list(set(matched))
 
-# 🔧 સમાધાન 3: Symbol અસ્તિત્વ ચકાસો yfinance માં પહેલાં
+# 🔧 Symbol existence check
 def is_valid_symbol(symbol):
     """
     Checks if a stock symbol is valid and has market data available via yfinance.
-    Args:
-        symbol (str): The stock symbol to check (e.g., "RELIANCE").
-    Returns:
-        bool: True if the symbol is valid and has market price info, False otherwise.
     """
     try:
-        # Attempt to get basic info for the symbol
         info = yf.Ticker(f"{symbol}.NS").info
-        # A common indicator of a valid, active stock is the presence of 'regularMarketPrice'
-        # or 'marketCap'. We use 'regularMarketPrice' as it's often present for active trading.
         return 'regularMarketPrice' in info and info['regularMarketPrice'] is not None
-    except Exception as e:
-        # This can catch issues like invalid symbols that yfinance cannot resolve
-        # print(f"DEBUG: is_valid_symbol check failed for {symbol}: {e}") # For debugging
+    except Exception:
         return False
 
 # 📈 4. Get stock return % using yfinance
 def get_stock_performance(symbol):
     """
     Retrieves the percentage change in stock price for the last two days using yfinance.
-    Args:
-        symbol (str): The stock symbol (e.g., "RELIANCE").
-    Returns:
-        float or None: The percentage change, rounded to 2 decimal places, or None if data is unavailable.
     """
     try:
         stock = yf.Ticker(f"{symbol}.NS")
-        # Fetch historical data for 2 days to get yesterday's and today's closing prices
         hist = stock.history(period="2d")
-
-        # 🔧 સમાધાન 2: yfinance ચેck કરો symbol supported છે કે નહિ
-        # Check if the historical data is empty or does not have enough entries
+        
         if hist.empty or len(hist) < 2:
-            print(f"⚠️ No sufficient historical data for {symbol}.NS — might be delisted, invalid, or recent listing.")
             return None
-
+            
         yesterday_close = hist['Close'].iloc[-2]
         today_close = hist['Close'].iloc[-1]
-
-        if yesterday_close == 0: # Avoid division by zero
-            print(f"⚠️ Yesterday's closing price for {symbol}.NS was 0, cannot calculate change.")
+        
+        if yesterday_close == 0:
             return None
-
+            
         change_percent = ((today_close - yesterday_close) / yesterday_close) * 100
         return round(change_percent, 2)
-    except Exception as e:
-        print(f"⚠️ Error fetching performance for {symbol}.NS: {e}")
+    except Exception:
         return None
 
 # 🧠 5. Full analysis runner
-def run_analysis():
+def run_analysis(min_return_threshold=5.0):
     """
-    Orchestrates the entire stock analysis process:
-    1. Fetches NSE stock list.
-    2. Fetches positive news.
-    3. Matches symbols from news.
-    4. Validates and retrieves stock performance for matched symbols.
-    5. Filters and prints stocks with >5% return.
+    Orchestrates the entire stock analysis process.
     """
-    print("📥 Fetching NSE symbols...")
-    all_symbols = get_nse_stock_list()
-    if not all_symbols:
-        print("❌ Could not fetch NSE symbols. Exiting analysis.")
-        return
-    print(f"✅ Loaded {len(all_symbols)} symbols")
+    results = {
+        'symbols_loaded': 0,
+        'news_found': 0,
+        'matched_symbols': [],
+        'performance_data': [],
+        'filtered_stocks': pd.DataFrame(),
+        'news_headlines': []
+    }
+    
+    # Progress tracking
+    progress_container = st.container()
+    
+    with progress_container:
+        st.info("📥 Fetching NSE symbols...")
+        all_symbols = get_nse_stock_list()
+        if not all_symbols:
+            st.error("❌ Could not fetch NSE symbols. Exiting analysis.")
+            return results
+        
+        results['symbols_loaded'] = len(all_symbols)
+        st.success(f"✅ Loaded {len(all_symbols)} symbols")
+        
+        st.info("🔄 Fetching latest positive news...")
+        news = get_positive_news()
+        if not news:
+            st.error("❌ Could not fetch positive news. Exiting analysis.")
+            return results
+        
+        results['news_found'] = len(news)
+        results['news_headlines'] = news
+        st.success(f"📌 Found {len(news)} positive news items")
+        
+        st.info("🔍 Matching symbols from news...")
+        progress_bar = st.progress(0, text="Processing news...")
+        matched_symbols = extract_symbols_from_news(news, all_symbols, progress_bar)
+        progress_bar.empty()
+        
+        if not matched_symbols:
+            st.warning("💡 No potential stocks found from news.")
+            return results
+        
+        results['matched_symbols'] = matched_symbols
+        st.success(f"💡 Found {len(matched_symbols)} potential stocks from news")
+        
+        st.info("📊 Analyzing price changes...")
+        performance_progress = st.progress(0, text="Analyzing stock performance...")
+        
+        performance_data = []
+        total_symbols = len(matched_symbols)
+        
+        for idx, symbol in enumerate(matched_symbols):
+            performance_progress.progress((idx + 1) / total_symbols, 
+                                        text=f"Analyzing {symbol} ({idx + 1}/{total_symbols})")
+            
+            if not is_valid_symbol(symbol):
+                continue
+                
+            change = get_stock_performance(symbol)
+            if change is not None:
+                performance_data.append({'Stock': symbol, 'Change %': change})
+        
+        performance_progress.empty()
+        
+        if performance_data:
+            result_df = pd.DataFrame(performance_data)
+            filtered = result_df[result_df["Change %"] > min_return_threshold].sort_values(by="Change %", ascending=False)
+            results['performance_data'] = performance_data
+            results['filtered_stocks'] = filtered
+    
+    return results
 
-    print("\n🔄 Fetching latest positive news...")
-    news = get_positive_news()
-    if not news:
-        print("❌ Could not fetch positive news. Exiting analysis.")
-        return
-    print(f"📌 Found {len(news)} positive news items")
-    print(f"Sample positive news (first 3): {news[:3]}...") # Add this line to see the news
-
-    print("\n🔍 Matching symbols from news...")
-    matched_symbols = extract_symbols_from_news(news, all_symbols)
-    if not matched_symbols:
-        print("💡 No potential stocks found from news.")
-        return
-    print(f"💡 Potential stocks from news: {matched_symbols}")
-
-    print("\n📊 Analyzing price changes...")
-    result = []
-    for symbol in matched_symbols:
-        # Validate symbol before attempting to get its performance
-        if not is_valid_symbol(symbol):
-            print(f"Skipping {symbol}: Not a valid or active yfinance symbol.")
-            continue
-
-        change = get_stock_performance(symbol)
-        if change is not None:
-            result.append((symbol, change))
-
-    result_df = pd.DataFrame(result, columns=["Stock", "Change %"])
-    # Filter for stocks with a positive change greater than 5%
-    filtered = result_df[result_df["Change %"] > 5].sort_values(by="Change %", ascending=False)
-
-    print("\n🔥 Stocks with >5% return today (may indicate next-day rally):")
-    if filtered.empty:
-        print("❌ No stocks found with >5% return today.")
+# Streamlit App Layout
+def main():
+    # Header
+    st.markdown('<h1 class="main-header">📈 NSE Stock News Analyzer</h1>', unsafe_allow_html=True)
+    st.markdown("**Discover potential rally stocks based on positive news and price movements**")
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        min_return = st.slider(
+            "Minimum Return Threshold (%)",
+            min_value=1.0,
+            max_value=20.0,
+            value=5.0,
+            step=0.5,
+            help="Filter stocks with returns greater than this percentage"
+        )
+        
+        st.markdown("---")
+        
+        if st.button("🚀 Run Analysis", type="primary", use_container_width=True):
+            st.session_state.analysis_run = True
+            with st.spinner("Running comprehensive analysis..."):
+                results = run_analysis(min_return)
+                st.session_state.results_data = results
+        
+        if st.button("🔄 Clear Results", use_container_width=True):
+            st.session_state.analysis_run = False
+            st.session_state.results_data = None
+            st.rerun()
+    
+    # Main content area
+    if st.session_state.analysis_run and st.session_state.results_data:
+        results = st.session_state.results_data
+        
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("📊 NSE Symbols Loaded", results['symbols_loaded'])
+        
+        with col2:
+            st.metric("📰 Positive News Found", results['news_found'])
+        
+        with col3:
+            st.metric("🎯 Symbols Matched", len(results['matched_symbols']))
+        
+        with col4:
+            st.metric(f"🔥 Stocks >{min_return}% Return", len(results['filtered_stocks']))
+        
+        # Results section
+        if not results['filtered_stocks'].empty:
+            st.header("🔥 Top Performing Stocks")
+            
+            # Create tabs for different views
+            tab1, tab2, tab3 = st.tabs(["📊 Results Table", "📈 Chart View", "📰 News Headlines"])
+            
+            with tab1:
+                # Styled dataframe
+                styled_df = results['filtered_stocks'].copy()
+                styled_df['Change %'] = styled_df['Change %'].apply(lambda x: f"+{x}%" if x > 0 else f"{x}%")
+                
+                st.dataframe(
+                    styled_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Stock": st.column_config.TextColumn("Stock Symbol", width="medium"),
+                        "Change %": st.column_config.TextColumn("Price Change", width="medium")
+                    }
+                )
+                
+                # Download button
+                csv = results['filtered_stocks'].to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Results as CSV",
+                    data=csv,
+                    file_name=f"stock_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+            
+            with tab2:
+                if len(results['filtered_stocks']) > 0:
+                    fig = px.bar(
+                        results['filtered_stocks'],
+                        x='Stock',
+                        y='Change %',
+                        title='Stock Performance (% Change)',
+                        color='Change %',
+                        color_continuous_scale='RdYlGn'
+                    )
+                    fig.update_layout(
+                        xaxis_title="Stock Symbol",
+                        yaxis_title="Percentage Change (%)",
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with tab3:
+                st.subheader("📰 Positive News Headlines")
+                for i, headline in enumerate(results['news_headlines'][:10], 1):
+                    st.write(f"{i}. {headline}")
+                
+                if len(results['news_headlines']) > 10:
+                    with st.expander(f"Show all {len(results['news_headlines'])} headlines"):
+                        for i, headline in enumerate(results['news_headlines'][10:], 11):
+                            st.write(f"{i}. {headline}")
+        
+        else:
+            st.warning(f"❌ No stocks found with >{min_return}% return today.")
+            
+            # Show all performance data if available
+            if results['performance_data']:
+                st.subheader("📊 All Analyzed Stocks")
+                all_performance_df = pd.DataFrame(results['performance_data'])
+                all_performance_df = all_performance_df.sort_values(by="Change %", ascending=False)
+                st.dataframe(all_performance_df, use_container_width=True, hide_index=True)
+    
     else:
-        print(filtered.to_string(index=False))
+        # Welcome message
+        st.info("👈 Click 'Run Analysis' in the sidebar to start discovering potential rally stocks!")
+        
+        # Feature highlights
+        st.subheader("🚀 Features")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("""
+            **📊 Data Sources:**
+            - NSE official stock listings
+            - MoneyControl positive news
+            - Yahoo Finance price data
+            """)
+        
+        with col2:
+            st.markdown("""
+            **🔍 Analysis Process:**
+            - Fetches latest positive news
+            - Matches stock symbols from headlines
+            - Calculates price performance
+            - Filters high-performing stocks
+            """)
+        
+        # Instructions
+        st.subheader("📝 How to Use")
+        st.markdown("""
+        1. **Adjust Settings:** Use the sidebar to set minimum return threshold
+        2. **Run Analysis:** Click the "Run Analysis" button
+        3. **View Results:** Browse through the results in different tabs
+        4. **Download Data:** Export results as CSV for further analysis
+        """)
 
-# ▶️ Run app
 if __name__ == "__main__":
-    run_analysis()
+    main()
